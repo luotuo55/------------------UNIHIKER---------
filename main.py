@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response
 from difflib import SequenceMatcher
 import json
 import uuid
@@ -18,9 +18,17 @@ import threading
 import socket
 import psutil
 import sys
+import queue
+import random
+from datetime import datetime
+import re
+from http import HTTPStatus
 
-# Flask 应用
-app = Flask(__name__)
+# Flask 应用初始化
+app = Flask(__name__, 
+    static_folder='.', # 设置当前目录为静态文件目录
+    static_url_path='' # 将静态文件URL路径设为空
+)
 
 # 共享数据存储
 class SharedData:
@@ -35,38 +43,56 @@ shared_data = SharedData()
 # Web 服务器路由
 @app.route('/')
 def index():
-    return send_file('index.html')
+    """首页路由"""
+    try:
+        print("尝试访问首页")
+        return send_file('index.html')  # 直接使用文件名，因为文件在同一目录
+    except Exception as e:
+        print(f"访问首页出错: {e}")
+        return f"Error: {str(e)}", 500
 
 @app.route('/submit', methods=['POST'])
 def submit():
+    """处理范文提交"""
     try:
-        print("收到提交请求")  # 调试信息
         data = request.get_json()
-        print(f"接收到的数据: {data}")  # 调试信息
+        print(f"收到范文提交: {data}")
         
-        if not data:
-            print("未接收到数据")
-            return jsonify({"status": "error", "message": "未接收到数据"}), 400
+        if not data or 'text' not in data:
+            return jsonify({
+                "status": "error", 
+                "message": "无效的范文数据"
+            }), 400
             
-        text = data.get('text', '').strip()
-        print(f"提取的文本: {text}")  # 调试信息
-        
+        text = data['text'].strip()
         if not text:
-            print("文本为空")
-            return jsonify({"status": "error", "message": "范文不能为空"}), 400
+            return jsonify({
+                "status": "error", 
+                "message": "范文不能为空"
+            }), 400
             
+        # 保存范文
         shared_data.target_text = text
-        print(f"已保存范文: {shared_data.target_text}")  # 调试信息
+        print(f"范文内容已保存: {text}")
         
-        return jsonify({
-            "status": "success", 
-            "message": "范文提交成功",
-            "text_length": len(text)
-        })
-        
+        # 验证是否保存成功
+        if shared_data.target_text == text:
+            return jsonify({
+                "status": "success", 
+                "message": "范文已成功保存"
+            })
+        else:
+            return jsonify({
+                "status": "error", 
+                "message": "范文保存失败"
+            }), 500
+            
     except Exception as e:
-        print(f"提交处理错误: {str(e)}")  # 调试信息
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"处理范文出错: {e}")
+        return jsonify({
+            "status": "error", 
+            "message": f"服务器错误: {str(e)}"
+        }), 500
 
 @app.route('/get_score')
 def get_score():
@@ -148,6 +174,8 @@ is_recording = True
 all_texts = []
 gui = None
 loop = None  # 添加全局 loop 变量
+scores = []  # 存储所有分数记录
+recognized_name = None  # 当前识别的学生姓名
 
 # 在程序最开始处（所有 import 语句之后）设置 API key
 def init_api_keys():
@@ -172,195 +200,167 @@ def init_api_keys():
         print(f"API密钥初始化失败: {e}")
         return False
 
-def call_qwen_api(text):
-    """调用千问API进行文本纠错"""
+def call_qwen_api(text, mode='correction'):
+    """统一的千问API调用函数"""
     try:
         if not dashscope.api_key:
             print("[错误] DashScope API Key未设置")
             return None
             
-        print(f"使用的API Key: {dashscope.api_key}")
-        
-        messages = [
-            {
-                'role': 'system',
-                'content': '你是一个专业的文本纠错助手。请对输入的文本进行标点符号和错别字的修正，保持原文的意思不变。'
-            },
-            {
-                'role': 'user',
-                'content': f'请修正以下文本的标点符号和错别字：\n{text}'
-            }
-        ]
+        if mode == 'scoring':
+            current_text = text.get('speech_text', '')
+            target_text = text.get('target_text', '')
+            messages = [
+                {
+                    'role': 'system',
+                    'content': '你是一个专业的朗读评分助手。请只返回三个分数，格式固定。'
+                },
+                {
+                    'role': 'user',
+                    'content': f"""
+请对比以下两段文本进行评分（满分100分）。只需返回三个分数，格式如下：
+准确度：数字
+完整度：数字
+流畅度：数字
+
+范文：{target_text}
+朗读文本：{current_text}
+"""
+                }
+            ]
+        else:  # correction mode
+            messages = [
+                {
+                    'role': 'system',
+                    'content': '你是一个专业的文本纠错助手。请对输入的文本进行标点符号和错别字的修正，保持原文的意思不变。'
+                },
+                {
+                    'role': 'user',
+                    'content': f'请修正以下文本的标点符号和错别字：\n{text}'
+                }
+            ]
         
         response = dashscope.Generation.call(
             model='qwen-plus',
             messages=messages,
-            result_format='message',
-            api_key=dashscope.api_key  # 显式传递API key
+            result_format='message'
         )
         
         if response.status_code == 200:
-            corrected_text = response.output.choices[0].message.content.strip()
-            print(f"[纠正结果] {corrected_text}")
-            return corrected_text
+            result = response.output.choices[0].message.content.strip()
+            print(f"[处理结果] {result}")
+            return result
         else:
-            error_msg = f"API调用失败: {response.code} - {response.message}"
-            print(f"[错误] {error_msg}")
+            print(f"[错误] API调用失败: {response.code} - {response.message}")
             return None
             
     except Exception as e:
-        error_msg = f"纠错API调用失败: {str(e)}"
-        print(f"[错误] {error_msg}")
+        print(f"[错误] API调用失败: {str(e)}")
         return None
 
 def on_correction_click():
-    """处理纠错按钮点击事件"""
+    """处理纠正按钮点击事件"""
     global is_recording
     try:
-        print("纠错按钮被点击")
+        print("纠正按钮被点击")
         
-        # 停止录音
+        # 1. 停止语音识别
         is_recording = False
-        print("正在停止录音...")
+        print("正在停止语音识别...")
         time.sleep(1)
         
-        # 获取当前文本
-        current_text = text_box.text.get("1.0", END)
-        print(f"正在纠错文本: {current_text}")
+        # 2. 获取当前文本
+        current_text = text_box.text.get("1.0", END).strip()
+        print(f"获取到的当前文本：{current_text}")
         
-        if not current_text.strip():
-            print("文本为空，无法纠错")
-            update_recognition_text("请先进行语音识别")
-            return
+        if current_text:
+            # 3. 调用API进行纠正
+            print("开始调用API进行纠正...")
+            result = call_qwen_api(current_text, mode='correction')
             
-        print("\n开始文本纠错...")
-        
-        # 构造提示词
-        prompt = f"""
-请对以下文本进行语法和用词纠错。
-如果发现错误，请返回修正后的完整文本；如果没有错误，请返回原文。
-
-文本内容：
-{current_text}
-
-请直接返回纠错后的文本，不需要其他解释。
-"""
-        
-        # 调用千问API
-        response = dashscope.Generation.call(
-            model='qwen-plus',
-            messages=[
-                {'role': 'system', 'content': '你是一个专业的文本纠错助手'},
-                {'role': 'user', 'content': prompt}
-            ],
-            result_format='message',
-            api_key=dashscope.api_key
-        )
-        
-        print(f"API响应状态码: {response.status_code}")
-        print(f"API完整响应: {response}")
-        
-        if response.status_code == 200:
-            corrected_text = response.output.choices[0].message.content.strip()
-            print(f"API返回结果: {corrected_text}")
-            
-            # 添加【纠错结果】标识并追加显示
-            display_text = f"\n【纠错结果】\n{corrected_text}"
-            update_recognition_text(display_text)
-            print("纠错完成")
-            
+            if result:
+                # 4. 显示纠正结果
+                update_recognition_text(f"[纠正结果]\n{result}")
+                print("更新显示完成")
+            else:
+                update_recognition_text("[错误] 文本纠正失败")
         else:
-            error_msg = f"API调用失败: {response.message}"
-            print(error_msg)
-            update_recognition_text(error_msg)
+            print("文本框为空，不进行API调用")
+            update_recognition_text("[错误] 请先进行语音识别")
             
     except Exception as e:
-        error_msg = f"文本纠错错误: {str(e)}"
+        error_msg = f"纠正文本错误: {str(e)}"
         print(error_msg)
         update_recognition_text(error_msg)
 
 def on_score_click():
     """处理打分按钮点击事件"""
-    global is_recording
+    global is_recording, scores, recognized_name
     try:
         print("打分按钮被点击")
         
-        # 停止语音识别
+        # 1. 停止语音识别
         is_recording = False
-        print("正在停止语...")
         time.sleep(1)
         
-        # 获取当前文本
-        current_text = text_box.text.get("1.0", END)
-        print(f"获取到的朗读文本：{current_text}")
-        
-        # 获取范文
+        # 2. 获取文本
+        current_text = text_box.text.get("1.0", END).strip()
         target_text = shared_data.target_text
-        if not target_text:
-            error_msg = "[错误] 请先在网页端输入范文"
+        
+        if not target_text or not current_text:
+            error_msg = "[错误] 请确保已输入范文且已完成语音识别"
             print(error_msg)
             update_recognition_text(error_msg)
             return
             
-        if not current_text.strip():
-            error_msg = "[错误] 请先进行语音识别"
+        if not recognized_name:
+            error_msg = "[错误] 请先识别姓名"
             print(error_msg)
             update_recognition_text(error_msg)
             return
-        
-        print("开始调用API进行评分...")
-        # 构造提示词
-        prompt = f"""
-请对比以下两段文本，从准确度、完整度、流畅度三维度进行评分（满100分），并给出详细分析：
-
-范文：
-{target_text}
-
-朗读文本：
-{current_text}
-
-请按以下格式输出：
-准确度：XX分
-完整度：XX分
-流畅度：XX分
-总分：XX分
-
-详细分析：
-1. 准确度分析：...
-2. 完整度分析：...
-3. 流畅度分析：...
-4. 改进建议：...
-"""
-        
-        # 调用API进行评分
-        response = dashscope.Generation.call(
-            api_key=os.getenv('DASHSCOPE_API_KEY'),
-            model="qwen-plus",
-            messages=[
-                {'role': 'system', 'content': 'You are a helpful assistant.'},
-                {'role': 'user', 'content': prompt}
-            ],
-            result_format='message'
-        )
-        
-        if response.status_code == 200:
-            result = response.output.choices[0].message.content
-            print(f"评分结果：{result}")
             
-            # 更新UNIHIKER显示
-            update_recognition_text(f"[评分结果]\n{result}")
+        # 3. 调用API进行评分
+        print("开始评分...")
+        result = call_qwen_api({
+            'speech_text': current_text,
+            'target_text': target_text
+        }, mode='scoring')
+        
+        if result:
+            # 解析分数
+            score_data = {}
+            for line in result.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = int(''.join(filter(str.isdigit, value.strip())))
+                    score_data[key] = value
             
-            # 更新共享数据供网页显示
-            shared_data.latest_score = {
-                "target_text": target_text,
-                "speech_text": current_text,
-                "score_result": result
+            # 构建分数记录
+            score_record = {
+                'name': recognized_name,
+                'accuracy': score_data.get('准确度', 0),
+                'fluency': score_data.get('流畅度', 0),
+                'completeness': score_data.get('完整度', 0),
+                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
             }
             
+            # 添加到分数列表
+            scores.append(score_record)
+            
+            # 更新显示
+            display_text = (
+                f"\n[评分结果]\n"
+                f"姓名：{score_record['name']}\n"
+                f"准确度：{score_record['accuracy']}\n"
+                f"流畅度：{score_record['fluency']}\n"
+                f"完整度：{score_record['completeness']}"
+            )
+            update_recognition_text(display_text)
+            print("评分完成")
+            
         else:
-            error_msg = f"评分失败: {response.message}"
-            print(error_msg)
-            update_recognition_text(f"[错误] {error_msg}")
+            update_recognition_text("[错误] 评分失败")
             
     except Exception as e:
         error_msg = f"评分错误: {str(e)}"
@@ -487,7 +487,7 @@ def toggle_confirmation_buttons(show_confirm=True):
         print(f"切换按钮显示状态时出错: {e}")
 
 def on_name_click():
-    """处理姓名按钮点击事件"""
+    """理姓名按钮点击事件"""
     global recognized_name, is_recording
     try:
         print("姓名按钮被点击")
@@ -502,7 +502,7 @@ def on_name_click():
         print(f"正在识别文本: {current_text}")
         
         if not current_text.strip():
-            print("文本为空，无法识别姓名")
+            print("文为空，无法识别姓")
             update_recognition_text("请先进行语音识别")
             return
             
@@ -600,54 +600,13 @@ def kill_existing_flask():
 def run_flask():
     """运行Flask服务器"""
     try:
-        # 先尝试释放端口
-        try:
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('0.0.0.0', 5000))
-            sock.close()
-        except Exception as e:
-            print(f"端口绑定测试失败: {e}")
-            # 尝试结束占用端口的进程
-            try:
-                import os
-                os.system("fuser -k 5000/tcp")
-                print("已尝试释放端口5000")
-                time.sleep(2)
-            except:
-                print("无法释放端口，请手动结束占用端口的进程")
-                return False
-
-        ip = get_ip_address()
-        server_info = """
-╔════════════════════════════════════════════════╗
-║             Web服务器启动信息                  ║
-╠════════════════════════════════════════════════╣
-║                                                ║
-║  状态: 正在启动...                            ║
-║  访问地址: http://{ip}:5000                   ║
-║  本地地址: http://localhost:5000              ║
-║  监听端口: 5000                               ║
-║                                                ║
-║  请在浏览器中访问以上地址来输入范文          ║
-║                                                ║
-╚════════════════════════════════════════════════╝
-""".format(ip=ip)
-        
-        print("\n" + server_info, flush=True)
-        
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-        return True
+        print("正在启动Flask服务器...")
+        app.run(host='0.0.0.0', port=5000, debug=False)
     except Exception as e:
-        print("\n" + "="*50)
-        print("【服务器启动失败】")
-        print(f"错误信息: {str(e)}")
-        print("="*50 + "\n")
-        return False
+        print(f"Flask服务器启动错误: {e}")
 
 def get_ip_address():
-    """获取本机IP地址"""
+    """获取机IP地址"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -735,7 +694,7 @@ class AsrWsClient:
             print(f"初始化响应: {result}")
             
             if 'payload_msg' in result and result['payload_msg']['code'] == self.success_code:
-                print("初始化成功")
+                print("初始化功")
                 print("录音任务已启动")
                 chunk_size = 9600
                 
@@ -790,7 +749,7 @@ def generate_header(
     return header
 
 def generate_audio_default_header():
-    """生成音频数据请求头"""
+    """生成频数据请求头"""
     return generate_header(message_type=CLIENT_AUDIO_ONLY_REQUEST)
 
 def parse_response(res):
@@ -841,15 +800,35 @@ def parse_response(res):
     except Exception as e:
         return {"error": f"Failed to parse response: {str(e)}"}
 
-def update_recognition_text(text, is_correction=False):
-    """更新识别结果文本框"""
+def update_recognition_text(new_text, is_correction=False):
+    """更新识别结果显示"""
     try:
-        if text_box and hasattr(text_box, 'text'):
-            # 直接追加文本
-            text_box.text.insert(END, f"{text}\n")
-            text_box.text.see(END)
+        print(f"\n准备更新显示文本: {new_text[:100]}...")  # 只打印前100个字符
+        
+        # 确保text_box存在
+        if not hasattr(text_box, 'text'):
+            print("错误：text_box.text不存在")
+            return
+            
+        # 添加到文本列表
+        all_texts.append(new_text)
+        
+        # 构建完整文本
+        full_text = "\n".join(all_texts)
+        
+        # 更新显示
+        text_box.config(text=full_text)
+        text_box.text.see(END)  # 滚动到底部
+        
+        # 刷新GUI
+        if gui and hasattr(gui, 'master') and gui.master.winfo_exists():
+            gui.update()
+            print("显示已更新")
+        else:
+            print("警告：GUI不存在或已关闭")
+            
     except Exception as e:
-        print(f"更新文本错误: {e}")
+        print(f"更新显示文本时出错: {str(e)}")
 
 @app.errorhandler(404)
 def not_found(error):
@@ -881,7 +860,7 @@ def on_retry_name():
         # 清空文本框
         if hasattr(text_box, 'text'):
             text_box.text.delete("1.0", END)
-            text_box.text.insert(END, "准备开始录音...\n")
+            text_box.text.insert(END, "准备开始录...\n")
             
         # 重置录音状态
         is_recording = False
@@ -890,7 +869,7 @@ def on_retry_name():
         start_button_click()
         
     except Exception as e:
-        print(f"重试姓名识别时出错: {e}")
+        print(f"重试姓识别时出错: {e}")
 
 def on_confirm_name():
     """确认姓名按钮点击处理"""
@@ -899,16 +878,81 @@ def on_confirm_name():
         if not recognized_name:
             print("没有可确认的姓名")
             update_recognition_text("请先点击姓名按钮进行识别")
-            return
+            return False
             
         print(f"姓名已确认: {recognized_name}")
         update_recognition_text(f"姓名 {recognized_name} 已确认\n可以继续录音...")
-        
-        # 这里可以添加其他确认后的操作
-        # 比如保存到数据库等
+        return True
         
     except Exception as e:
         print(f"确认姓名时出错: {e}")
+        return False
+
+@app.route('/get_scores')
+def get_scores():
+    """获取所有分数记录"""
+    global scores
+    return jsonify(scores)
+
+@app.route('/clear_scores', methods=['POST'])
+def clear_scores():
+    """清除所有分数记录"""
+    global scores
+    try:
+        scores = []
+        return jsonify({"status": "success", "message": "分数记录已清除"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# 添加CORS支持
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST')
+    return response
+
+@app.route('/score', methods=['POST'])
+def handle_score():
+    """处理打分请求"""
+    try:
+        if not recognized_name:
+            return jsonify({"status": "error", "message": "请先识别姓名"}), 400
+            
+        if not corrected_text or not reference_text:
+            return jsonify({"status": "error", "message": "请先完成朗读"}), 400
+            
+        # 获取千文评分
+        score_results = get_scores_from_qianwen(corrected_text, reference_text)
+        if not score_results:
+            return jsonify({"status": "error", "message": "评分失败"}), 500
+            
+        # 生成分数记录
+        score_data = {
+            'name': recognized_name,
+            'accuracy': score_results['accuracy'],
+            'fluency': score_results['fluency'],
+            'completeness': score_results['completeness'],
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # 添加到scores列表
+        scores.append(score_data)
+        
+        # 显示在UNIHIKER屏幕上
+        score_text = (
+            f"\n【评分结果】\n"
+            f"姓名：{score_data['name']}\n"
+            f"准确度：{score_data['accuracy']}\n"
+            f"流畅度：{score_data['fluency']}\n"
+            f"完整度：{score_data['completeness']}"
+        )
+        update_recognition_text(score_text)
+        
+        return jsonify({"status": "success", "data": score_data})
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     try:

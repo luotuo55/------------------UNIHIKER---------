@@ -78,6 +78,57 @@
         .sending {
             color: blue;
         }
+        .score-area {
+            margin-top: 30px;
+        }
+        .score-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            table-layout: fixed;
+        }
+        .score-table th,
+        .score-table td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: center;
+            word-wrap: break-word;
+        }
+        .score-table th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        .score-table th:nth-child(1),
+        .score-table td:nth-child(1) {
+            width: 25%;
+        }
+        .score-table th:nth-child(2),
+        .score-table td:nth-child(2),
+        .score-table th:nth-child(3),
+        .score-table td:nth-child(3),
+        .score-table th:nth-child(4),
+        .score-table td:nth-child(4) {
+            width: 25%;
+        }
+        .score-table tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        .score-table tr:hover {
+            background-color: #f5f5f5;
+        }
+        .clear-btn {
+            margin: 10px 0;
+            padding: 5px 10px;
+            background-color: #ff4444;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        .clear-btn:hover {
+            background-color: #cc0000;
+        }
     </style>
 </head>
 <body>
@@ -103,9 +154,30 @@
                 <pre id="scoreText"></pre>
             </div>
         </div>
+        <div class="score-area">
+            <h3>评分记录：</h3>
+            <button onclick="clearScores()" class="clear-btn">清除记录</button>
+            <table id="scoreTable" class="score-table">
+                <thead>
+                    <tr>
+                        <th>姓名</th>
+                        <th>准确度</th>
+                        <th>流畅度</th>
+                        <th>完整度</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- 分数数据将通过JavaScript动态添加 -->
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <script>
+        // 全局变量存储最后一次更新时间
+        let lastUpdateTime = 0;
+        const UPDATE_INTERVAL = 5000; // 5秒更新一次
+
         // 范文提交处理
         document.getElementById('textForm').onsubmit = function(e) {
             e.preventDefault();
@@ -173,6 +245,106 @@
         }
 
         setInterval(checkScore, 1000);
+
+        // 获取分数并更新表格
+        function updateScoreTable(score) {
+            var table = document.getElementById('scoreTable');
+            var row = table.insertRow(-1);
+            
+            var nameCell = row.insertCell(0);
+            nameCell.textContent = score.name || '未识别';
+            if (score.name === '未识别') {
+                nameCell.style.color = 'red';
+            }
+            
+            row.insertCell(1).textContent = score.accuracy || '-';
+            row.insertCell(2).textContent = score.fluency || '-';
+            row.insertCell(3).textContent = score.completeness || '-';
+            
+            row.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+
+        // 定时获取最新分数
+        let lastScoreCount = 0;  // 记录上次的分数数量
+        
+        function fetchLatestScores() {
+            fetch('http://10.1.2.3:5000/get_scores')
+                .then(response => response.json())
+                .then(scores => {
+                    if (scores && scores.length > lastScoreCount) {
+                        // 只显示新增的分数
+                        for (let i = lastScoreCount; i < scores.length; i++) {
+                            updateScoreTable(scores[i]);
+                        }
+                        lastScoreCount = scores.length;
+                    }
+                })
+                .catch(error => {
+                    // 静默处理错误，不在控制台显示
+                    // console.error('获取分数失败:', error);
+                });
+        }
+
+        // 每秒检查一次新分数
+        setInterval(fetchLatestScores, 1000);
+        
+        // 页面加载时获取现有分数
+        fetchLatestScores();
+
+        // 添加清除功能
+        function clearScores() {
+            if (confirm('确定要清除所有记录吗？')) {
+                fetch('http://10.1.2.3:5000/clear_scores', {
+                    method: 'POST'
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        // 清空表格
+                        var table = document.getElementById('scoreTable');
+                        while (table.rows.length > 1) {
+                            table.deleteRow(1);
+                        }
+                        lastScoreCount = 0;
+                    }
+                })
+                .catch(error => console.error('清除失败:', error));
+            }
+        }
+
+        function updateScores() {
+            const now = Date.now();
+            if (now - lastUpdateTime < UPDATE_INTERVAL) {
+                return;
+            }
+            lastUpdateTime = now;
+            
+            fetch('http://10.1.2.3:5000/get_scores')
+                .then(response => response.json())
+                .then(data => {
+                    const table = document.getElementById('scoreTable');
+                    // 清空现有行（保留表头）
+                    while (table.rows.length > 1) {
+                        table.deleteRow(1);
+                    }
+                    // 添加新数据
+                    data.forEach(score => {
+                        const row = table.insertRow();
+                        row.insertCell().textContent = score.name;
+                        row.insertCell().textContent = score.accuracy;
+                        row.insertCell().textContent = score.fluency;
+                        row.insertCell().textContent = score.completeness;
+                        row.insertCell().textContent = score.timestamp;
+                    });
+                })
+                .catch(error => console.error('获取分数失败:', error));
+        }
+
+        // 每5秒更新一次分数
+        setInterval(updateScores, UPDATE_INTERVAL);
+
+        // 页面加载时更新一次
+        document.addEventListener('DOMContentLoaded', updateScores);
     </script>
 </body>
 </html>
