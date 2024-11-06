@@ -210,6 +210,13 @@ def call_qwen_api(text, mode='correction'):
         if mode == 'scoring':
             current_text = text.get('speech_text', '')
             target_text = text.get('target_text', '')
+            
+            # 打印调试信息
+            print("\n=== 评分文本对比 ===")
+            print(f"范文({len(target_text)}字)：\n{target_text}")
+            print(f"\n朗读文本({len(current_text)}字)：\n{current_text}")
+            print("==================\n")
+            
             messages = [
                 {
                     'role': 'system',
@@ -228,6 +235,10 @@ def call_qwen_api(text, mode='correction'):
 """
                 }
             ]
+            
+            print("发送给千问的消息：")
+            print(json.dumps(messages, ensure_ascii=False, indent=2))
+            
         else:  # correction mode
             messages = [
                 {
@@ -327,21 +338,42 @@ def on_score_click():
         }, mode='scoring')
         
         if result:
+            print(f"\n=== 开始解析评分结果 ===")
+            print(f"原始结果：{result}")
+            
             # 解析分数
-            score_data = {}
+            score_data = {
+                '准确度': 0,
+                '完整度': 0,
+                '流畅度': 0
+            }
+            
             for line in result.split('\n'):
-                if ':' in line:
-                    key, value = line.split(':', 1)
+                line = line.strip()
+                print(f"处理行: {line}")
+                if ':' in line or '：' in line:  # 同时处理中英文冒号
+                    # 分割并清理数据
+                    key, value = line.replace('：', ':').split(':', 1)
                     key = key.strip()
-                    value = int(''.join(filter(str.isdigit, value.strip())))
-                    score_data[key] = value
+                    value = value.strip()
+                    print(f"键: '{key}', 值: '{value}'")
+                    
+                    try:
+                        # 提取数字
+                        score = int(value)
+                        score_data[key] = score
+                        print(f"成功解析: {key} = {score}")
+                    except ValueError as e:
+                        print(f"解析数字失败: {e}")
+            
+            print(f"解析后的分数: {score_data}")
             
             # 构建分数记录
             score_record = {
                 'name': recognized_name,
-                'accuracy': score_data.get('准确度', 0),
-                'fluency': score_data.get('流畅度', 0),
-                'completeness': score_data.get('完整度', 0),
+                'accuracy': score_data['准确度'],
+                'fluency': score_data['流畅度'],
+                'completeness': score_data['完整度'],
                 'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
             }
             
@@ -358,6 +390,7 @@ def on_score_click():
             )
             update_recognition_text(display_text)
             print("评分完成")
+            print(f"最终记录: {score_record}")
             
         else:
             update_recognition_text("[错误] 评分失败")
@@ -510,8 +543,7 @@ def on_name_click():
         
         # 构造提示词
         prompt = f"""
-请从以下文本中识别出人名（如果有的话）。
-如果能识别出人名，只需返回这个人名；如果没有识别出人名，请返回"未识别到姓名"。
+请从以下文本描述，推测出一个人名。如果能推测出人名，只需返回这个人名；如果有两个人名，请返回最后一个人名；如果没能推测出人名，请返回"未识别到姓名"。
 
 文本内容：
 {current_text}
